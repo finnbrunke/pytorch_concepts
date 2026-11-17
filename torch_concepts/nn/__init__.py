@@ -77,6 +77,13 @@ from .modules.high.models.cvae import ConditionalVAE
 from .modules.high.models.graph_cbm import GraphConceptBottleneckModel
 from .modules.high.models.c2bm import CausallyReliableConceptBottleneckModel
 from .modules.high.models.cmr import CMRTaskLoss, ConceptMemoryReasoner
+from .modules.high.models.cmrts import (
+    CMRTemporalOutput,
+    ConceptMemoryReasonerTS,
+    STLRuleDecoder,
+    STLRuleSpec,
+    SequenceEncoder,
+)
 
 # Models (mid-level)
 from .modules.mid.factors.factor import ParametricFactor
@@ -193,6 +200,11 @@ __all__ = [
     "OrthogonalityLoss",
     "NLLProbLoss",
     "CMRTaskLoss",
+    "CMRTemporalOutput",
+    "ConceptMemoryReasonerTS",
+    "STLRuleDecoder",
+    "STLRuleSpec",
+    "SequenceEncoder",
 
     # Training callbacks
     "LossWeightWarmup",
