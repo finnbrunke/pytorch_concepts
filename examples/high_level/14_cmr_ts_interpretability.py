@@ -17,6 +17,8 @@ Run from the repository root:
     python -m examples.high_level.14_cmr_ts_interpretability --dataset mit_bih
     python -m examples.high_level.14_cmr_ts_interpretability --concept-source ground_truth
 
+``cluster/sweep.sbatch`` runs a grid of these settings as a Slurm job array.
+
 The full report is saved as ``report.json`` in the run's log directory.
 """
 
@@ -27,6 +29,7 @@ from pathlib import Path
 
 import torch
 from pytorch_lightning import Trainer
+from pytorch_lightning.loggers import CSVLogger
 from torch.utils.data import DataLoader, Subset
 
 from torch_concepts import seed_everything
@@ -62,7 +65,8 @@ def mit_bih_data(args):
     from torch_concepts.data.datasets.mit_bih import MITBIHArrhythmiaDataset
 
     mit = importlib.import_module("examples.high_level.13_mit_bih_cmr_ts_training")
-    options = dict(root=Path("data/mitdb"), window_seconds=4.0, downsample=4, download=True)
+    options = dict(root=Path(args.data_root), window_seconds=4.0, downsample=4,
+                   download=not args.no_download)
     train = MITBIHArrhythmiaDataset(records=mit.TRAIN_RECORDS, **options)
     test = MITBIHArrhythmiaDataset(records=mit.TEST_RECORDS, **options)
     order = torch.randperm(len(train), generator=torch.Generator().manual_seed(0)).tolist()
@@ -81,7 +85,7 @@ def fit(model, args, loaders, name, callbacks=(), **learner_options):
     learner = TemporalCMRLearner(model, **learner_options)
     trainer = Trainer(
         max_epochs=args.epochs,
-        logger=_shared.make_logger(args, name),
+        logger=_shared.make_logger(args, f"{args.run_name}_{name}" if args.run_name else name),
         callbacks=list(callbacks),
         enable_checkpointing=False,
         enable_model_summary=False,
@@ -184,6 +188,12 @@ def parse_args():
                         help="up-weight rare binary concept steps in the concept loss")
     parser.add_argument("--n-repeats", type=int, default=3)
     parser.add_argument("--n-samples", type=int, default=5, help="rulebooks drawn in 'sample' mode")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--log-dir", default="lightning_logs", help="where logs and report.json go")
+    parser.add_argument("--run-name", default=None, help="prefix of the logger run names")
+    parser.add_argument("--data-root", default="data/mitdb", help="MIT-BIH record directory")
+    parser.add_argument("--no-download", action="store_true",
+                        help="fail instead of downloading missing MIT-BIH records")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="cmr-ts")
     parser.add_argument("--offline", action="store_true")
@@ -192,7 +202,7 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    seed_everything(7)
+    seed_everything(args.seed)
     data = predator_prey_data if args.dataset == "predator_prey" else mit_bih_data
     annotations, task_names, input_size, horizon, loaders, rulebook = data(args)
     encoder = dict(latent_size=args.latent_size, encoder_kind="gru",
@@ -222,7 +232,11 @@ def main() -> None:
     print_report(report.report["soft"])
     print_comparison(report.report)
 
-    out = Path(trainer.log_dir or ".") / "report.json"
+    if isinstance(trainer.logger, CSVLogger):  # <log-dir>/<run>/version_N
+        out = Path(trainer.logger.log_dir) / "report.json"
+    else:  # W&B shares its save_dir between runs
+        run = f"{args.run_name}_{args.dataset}_cmr" if args.run_name else f"{args.dataset}_cmr"
+        out = Path(args.log_dir) / run / "report.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report.report, indent=2, default=float))
     print(f"\nfull report: {out}")

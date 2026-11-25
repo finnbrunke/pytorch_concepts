@@ -29,15 +29,16 @@ from torch_concepts.nn import (
 
 
 def make_logger(args, name: str):
+    log_dir = getattr(args, "log_dir", "lightning_logs")
     if not args.wandb:
-        return CSVLogger("lightning_logs", name=name)
+        return CSVLogger(log_dir, name=name)
     try:
         from pytorch_lightning.loggers import WandbLogger
     except ImportError as exc:  # pragma: no cover
         raise ImportError("--wandb requires: pip install wandb") from exc
     return WandbLogger(
         project=args.wandb_project, name=name, offline=args.offline,
-        save_dir="lightning_logs",  # keeps ./wandb out of the repository root
+        save_dir=log_dir,  # keeps ./wandb out of the repository root
     )
 
 

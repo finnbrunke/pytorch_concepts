@@ -94,3 +94,6 @@ outputs/
 results/
 examples/experiments/*.png
 wandb/
+
+# Slurm job output
+cluster/logs/
