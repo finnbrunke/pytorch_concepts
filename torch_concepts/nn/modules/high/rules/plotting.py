@@ -154,8 +154,9 @@ def plot_rule_bank(
     concept_names: Sequence[str],
     selection: Optional[np.ndarray] = None,
     title: str = "",
+    kinds: Optional[Sequence[str]] = None,
 ):
-    """Snapshot of a learned SNF bank ``G(A -> F_[start,end] B)``.
+    """Snapshot of a learned rule bank (one clause per rule).
 
     Left: antecedent and consequent concept weights (softmax) per rule. Right:
     each rule's interval; bar opacity is its mean selection weight.
@@ -164,11 +165,17 @@ def plot_rule_bank(
         antecedent_weights, consequent_weights: ``(tasks, rules, concepts)``.
         starts, ends: ``(tasks, rules)`` in time steps.
         selection: optional ``(tasks, rules)`` mean selection weights.
+        kinds: optional most likely template per rule (flattened task-major),
+            shown in the row labels.
     """
     from matplotlib.colors import LinearSegmentedColormap
 
     n_tasks, n_rules, n_concepts = antecedent_weights.shape
+    short = {"always_implies_eventually": "G(A→F B)", "eventually_and_eventually": "F(A∧F B)",
+             "always_not": "G ¬A"}
     rows = [f"{task} · r{rule}" for task in task_names for rule in range(n_rules)]
+    if kinds is not None:
+        rows = [f"{row}  {short.get(kind, kind)}" for row, kind in zip(rows, kinds)]
     figure = _new_figure(10.5, 0.9 + 0.32 * len(rows))
     axes = figure.subplots(
         1, 3, gridspec_kw={"width_ratios": [n_concepts, n_concepts, 8], "wspace": 0.08}

@@ -24,6 +24,7 @@ from torch_concepts.nn import (
     SNFConfig,
     TemporalCMRLearner,
     TemporalCMRMonitor,
+    format_rule,
 )
 
 
@@ -43,12 +44,7 @@ def make_logger(args, name: str):
 def print_summary(learner: TemporalCMRLearner) -> None:
     print("\nlearned rules:")
     for rule in learner.model.rule_decoder.export_rules():
-        antecedent, consequent = rule["antecedent"], rule["consequent"]
-        start, end = rule["interval"]
-        print(
-            f"  {rule['task']:<24} G({antecedent['concept']} > {antecedent['threshold']:.2f}"
-            f" -> F[{start:.0f},{end:.0f}] {consequent['concept']} > {consequent['threshold']:.2f})"
-        )
+        print(f"  {rule['task']:<24} {format_rule(rule)}")
     print("\ntest metrics (majority-class accuracy in brackets):")
     for task, values in learner.test_metrics.items():
         auroc = f"{values['auroc']:.3f}" if "auroc" in values else "  n/a"

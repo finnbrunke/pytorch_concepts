@@ -261,6 +261,7 @@ class TemporalCMRMonitor(pl.Callback):
                 antecedent, consequent, start, end, decoder.config.max_horizon,
                 decoder.task_names, decoder.annotations.labels,
                 selection=np.asarray(selection), title=f"epoch {epoch}",
+                kinds=[rule["kind"] for rule in decoder.export_rules()],
             )
             self._emit(trainer, "plots/rule_bank", figure, epoch)
 

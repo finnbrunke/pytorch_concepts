@@ -378,8 +378,10 @@ def rule_compactness(
       uniform) of the antecedent and consequent concept weights. High values
       mean the soft rule mixes concepts, so its exported (argmax) version
       says less than the model uses.
-    * ``duplicate_rules``: pairs of rules with the same antecedent and
-      consequent concepts whose intervals overlap with IoU >= ``overlap``.
+    * ``template_entropy``: mean normalised entropy of the template choice
+      (only with more than one template).
+    * ``duplicate_rules``: pairs of rules with the same template, antecedent
+      and consequent concepts whose intervals overlap with IoU >= ``overlap``.
     * ``selection_entropy`` (needs ``dataloader``): mean normalised entropy
       of the per-sample rule selection (0 = one rule per sample).
     * ``rules_used`` (needs ``dataloader``): rules that are some sample's
@@ -397,6 +399,10 @@ def rule_compactness(
     start, end = decoder._intervals()
     antecedent = decoder.antecedent_logits.argmax(-1)
     consequent = decoder.consequent_logits.argmax(-1)
+    template = (
+        decoder.template_logits.argmax(-1) if decoder.template_logits is not None
+        else torch.zeros_like(antecedent)
+    )
     selections = None
     if dataloader is not None:
         from .cmrts_learner import TemporalCMRLearner
@@ -414,7 +420,9 @@ def rule_compactness(
         duplicates = 0
         for a in range(model.n_rules):
             for b in range(a + 1, model.n_rules):
-                same = antecedent[k, a] == antecedent[k, b] and consequent[k, a] == consequent[k, b]
+                same = (antecedent[k, a] == antecedent[k, b]
+                        and consequent[k, a] == consequent[k, b]
+                        and template[k, a] == template[k, b])
                 inter = (torch.minimum(end[k, a], end[k, b]) - torch.maximum(start[k, a], start[k, b])).clamp_min(0)
                 union = torch.maximum(end[k, a], end[k, b]) - torch.minimum(start[k, a], start[k, b])
                 duplicates += bool(same and inter / union.clamp_min(1e-6) >= overlap)
@@ -422,6 +430,10 @@ def rule_compactness(
             "concept_entropy": float(concept_entropy[k].mean()),
             "duplicate_rules": float(duplicates),
         }
+        if decoder.template_logits is not None:
+            row["template_entropy"] = float(
+                _normalised_entropy(decoder.template_logits[k].softmax(-1)).mean()
+            )
         if selections is not None:
             row["selection_entropy"] = float(_normalised_entropy(selections[:, k]).mean())
             row["rules_used"] = float(selections[:, k].argmax(-1).unique().numel())

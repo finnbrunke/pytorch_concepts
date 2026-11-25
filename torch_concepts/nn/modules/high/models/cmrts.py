@@ -35,6 +35,7 @@ class SequenceEncoder(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.0,
         n_heads: int = 4,
+        bidirectional: bool = False,
     ):
         super().__init__()
         if input_size <= 0 or latent_size <= 0:
@@ -49,20 +50,26 @@ class SequenceEncoder(nn.Module):
         self.kind = kind
         self.input_size = input_size
         self.latent_size = latent_size
+        if bidirectional and kind not in {"gru", "lstm"}:
+            raise ValueError("bidirectional is only available for 'gru' and 'lstm'.")
 
         if kind in {"gru", "lstm"}:
             recurrent = nn.GRU if kind == "gru" else nn.LSTM
+            if bidirectional and latent_size % 2:
+                raise ValueError("latent_size must be even for a bidirectional encoder.")
             self.input_projection = (
                 nn.Linear(input_size, hidden_size)
                 if hidden_size != input_size
                 else nn.Identity()
             )
+            # Both directions together give latent_size features per step.
             self.encoder = recurrent(
                 input_size=hidden_size,
-                hidden_size=latent_size,
+                hidden_size=latent_size // 2 if bidirectional else latent_size,
                 num_layers=num_layers,
                 dropout=dropout if num_layers > 1 else 0.0,
                 batch_first=True,
+                bidirectional=bidirectional,
             )
         elif kind == "transformer":
             if latent_size % n_heads != 0:
@@ -287,11 +294,18 @@ class ConceptMemoryReasonerTS(nn.Module):
         n_rules: Number of candidate rules per task.
         latent_size: Width of the sequence representation.
         encoder_kind: ``"gru"``, ``"lstm"``, ``"transformer"``, or ``"mlp"``.
+        encoder_bidirectional: Bidirectional GRU/LSTM (each step sees past and
+            future; suited to whole-window classification).
         pooling: Temporal pooling for global rule selection: ``"mean"``,
             ``"max"``, or ``"last"``.
         snf_config: Enables the differentiable SNF rule bank when provided.
         stl_smoothness: Inverse temperature of the fixed rules' smooth min/max;
             ``None`` evaluates them with exact hard semantics.
+        selection: ``"soft"`` mixes the rules of a task with the selector's
+            softmax weights. ``"straight_through"`` selects one rule per
+            sample: a hard Gumbel-softmax sample in training (straight-through
+            gradients) and the argmax in eval mode.
+        selection_temperature: Gumbel-softmax temperature of the selection.
     """
 
     def __init__(
@@ -306,11 +320,14 @@ class ConceptMemoryReasonerTS(nn.Module):
         encoder_layers: int = 1,
         encoder_dropout: float = 0.0,
         transformer_heads: int = 4,
+        encoder_bidirectional: bool = False,
         pooling: str = "mean",
         rule_specs: Optional[List[Union[STLRuleSpec, dict]]] = None,
         robustness_scale: float = 5.0,
         snf_config: Optional[SNFConfig] = None,
         stl_smoothness: Optional[float] = 10.0,
+        selection: str = "soft",
+        selection_temperature: float = 1.0,
     ):
         super().__init__()
         if isinstance(task_names, str):
@@ -328,6 +345,12 @@ class ConceptMemoryReasonerTS(nn.Module):
 
         self.n_rules = n_rules
         self._discrete = None  # set by discrete_rules()
+        if selection not in {"soft", "straight_through"}:
+            raise ValueError("selection must be 'soft' or 'straight_through'.")
+        if selection_temperature <= 0:
+            raise ValueError("selection_temperature must be positive.")
+        self.selection = selection
+        self.selection_temperature = selection_temperature
         self.latent_size = latent_size
         self.pooling = pooling
         self.rule_specs = rule_specs
@@ -341,6 +364,7 @@ class ConceptMemoryReasonerTS(nn.Module):
             num_layers=encoder_layers,
             dropout=encoder_dropout,
             n_heads=transformer_heads,
+            bidirectional=encoder_bidirectional,
         )
         self.concept_head = nn.Linear(latent_size, len(annotations.labels))
         self.rule_selector = nn.Linear(
@@ -414,7 +438,16 @@ class ConceptMemoryReasonerTS(nn.Module):
             len(self.task_names),
             self.n_rules,
         )
-        selector = torch.softmax(selector_logits, dim=-1)
+        if self.selection == "soft" or self._discrete is not None:
+            selector = torch.softmax(selector_logits, dim=-1)
+        elif self.training:
+            selector = torch.nn.functional.gumbel_softmax(
+                selector_logits, tau=self.selection_temperature, hard=True, dim=-1
+            )
+        else:
+            selector = torch.nn.functional.one_hot(
+                selector_logits.argmax(-1), self.n_rules
+            ).to(selector_logits.dtype)
         decoder_concepts = concepts
         if concept_values is not None:
             if concept_values.shape != concepts.shape:
@@ -556,6 +589,7 @@ class SequenceBlackBox(nn.Module):
         encoder_layers: int = 1,
         encoder_dropout: float = 0.0,
         transformer_heads: int = 4,
+        encoder_bidirectional: bool = False,
         pooling: str = "mean",
         head_hidden_size: Optional[int] = None,
     ):
@@ -576,6 +610,7 @@ class SequenceBlackBox(nn.Module):
             num_layers=encoder_layers,
             dropout=encoder_dropout,
             n_heads=transformer_heads,
+            bidirectional=encoder_bidirectional,
         )
         hidden = head_hidden_size or latent_size
         self.head = nn.Sequential(

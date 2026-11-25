@@ -341,18 +341,28 @@ def _logit(p: float) -> float:
 def edit_rule(model, task: Union[str, int], rule: int, spec: dict):
     """Inside the block, a learned SNF rule is replaced by an expert rule.
 
-    ``spec`` uses the rulebook format of kind ``"always_implies_eventually"``
-    (the form the SNF bank can represent): ``antecedent`` / ``consequent``
-    ``{"concept", "threshold"}`` and ``interval`` ``[start, end]`` in time
-    steps. The rule's parameters are restored when the block exits.
+    ``spec`` uses the rulebook format; its ``kind`` must be one of the
+    bank's templates (``SNFConfig.templates``). Concept predicates are given
+    as ``antecedent``/``consequent`` or by the kind's own names
+    (``first``/``second``, ``predicate``), each ``{"concept", "threshold"}``,
+    and the interval as ``[start, end]`` in time steps (not needed for
+    ``always_not``). The rule's parameters are restored when the block exits.
     """
     from ..rules.snf import SNFRuleDecoder
 
     decoder = model.rule_decoder
     if not isinstance(decoder, SNFRuleDecoder):
         raise TypeError("edit_rule needs a model with a learned SNF rule bank.")
-    if spec.get("kind") != "always_implies_eventually":
-        raise ValueError("The SNF bank only represents 'always_implies_eventually' rules.")
+    kind = spec.get("kind")
+    if kind not in decoder.templates:
+        raise ValueError(
+            f"The SNF bank only represents {list(decoder.templates)} rules, not {kind!r}."
+        )
+    aliases = {"first": "antecedent", "second": "consequent", "predicate": "antecedent"}
+    spec = {aliases.get(key, key): value for key, value in spec.items()}
+    if kind == "always_not":
+        spec.setdefault("consequent", spec["antecedent"])
+        spec.setdefault("interval", [0, decoder.config.min_interval])
     task_index = model.task_names.index(task) if isinstance(task, str) else int(task)
     labels = list(decoder.annotations.labels)
     horizon = float(decoder.config.max_horizon)
@@ -365,7 +375,7 @@ def edit_rule(model, task: Union[str, int], rule: int, spec: dict):
     names = (
         "antecedent_logits", "consequent_logits", "antecedent_threshold_logits",
         "consequent_threshold_logits", "start_logits", "width_logits",
-    )
+    ) + (("template_logits",) if decoder.template_logits is not None else ())
     saved = {name: getattr(decoder, name).detach().clone() for name in names}
     try:
         with torch.no_grad():
@@ -377,6 +387,9 @@ def edit_rule(model, task: Union[str, int], rule: int, spec: dict):
                 getattr(decoder, f"{role}_threshold_logits")[task_index, rule] = _logit(
                     float(spec[role].get("threshold", 0.5))
                 )
+            if decoder.template_logits is not None:
+                decoder.template_logits[task_index, rule] = -20.0
+                decoder.template_logits[task_index, rule, decoder.templates.index(kind)] = 20.0
             decoder.start_logits[task_index, rule] = _logit(start / (horizon - min_width))
             decoder.width_logits[task_index, rule] = _logit(
                 (end - start - min_width) / max(horizon - start - min_width, 1e-6)

@@ -37,7 +37,10 @@ from torch_concepts.nn import (
     TemporalCMRLearner,
     TemporalCMRMonitor,
     TemporalInterpretabilityReport,
+    concept_pos_weight,
+    format_rule,
 )
+from torch_concepts.nn.modules.high.rules import TEMPLATES
 
 _shared = importlib.import_module("examples.high_level.12_cmr_ts_training")
 
@@ -161,10 +164,7 @@ def print_comparison(reports: dict) -> None:
     if "argmax" in reports:
         print("\n== argmax rulebook")
         for rule in reports["argmax"]["rulebook"]:
-            a, c = rule["antecedent"], rule["consequent"]
-            start, end = rule["interval"]
-            print(f"  {rule['task']:<24} G({a['concept']} > {a['threshold']:.2f}"
-                  f" -> F[{start},{end}] {c['concept']} > {c['threshold']:.2f})")
+            print(f"  {rule['task']:<24} {format_rule(rule)}")
 
 
 def parse_args():
@@ -173,6 +173,15 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--concept-source", choices=("predicted", "ground_truth"),
                         default="predicted", help="joint or independent training of the rules")
+    parser.add_argument("--discrete", choices=("soft", "straight_through"), default="soft",
+                        help="train with soft or straight-through discrete rules and selection")
+    parser.add_argument("--all-templates", action="store_true",
+                        help="let rules choose G(A->F B), F(A and F B) or G(not A)")
+    parser.add_argument("--bidirectional", action="store_true", help="bidirectional GRU encoder")
+    parser.add_argument("--latent-size", type=int, default=16)
+    parser.add_argument("--encoder-layers", type=int, default=1)
+    parser.add_argument("--pos-weight", action="store_true",
+                        help="up-weight rare binary concept steps in the concept loss")
     parser.add_argument("--n-repeats", type=int, default=3)
     parser.add_argument("--n-samples", type=int, default=5, help="rulebooks drawn in 'sample' mode")
     parser.add_argument("--wandb", action="store_true")
@@ -186,7 +195,9 @@ def main() -> None:
     seed_everything(7)
     data = predator_prey_data if args.dataset == "predator_prey" else mit_bih_data
     annotations, task_names, input_size, horizon, loaders, rulebook = data(args)
-    encoder = dict(latent_size=16, encoder_kind="gru")
+    encoder = dict(latent_size=args.latent_size, encoder_kind="gru",
+                   encoder_layers=args.encoder_layers, encoder_bidirectional=args.bidirectional)
+    templates = TEMPLATES if args.all_templates else ("always_implies_eventually",)
 
     blackbox, _ = fit(SequenceBlackBox(input_size, task_names, **encoder), args, loaders,
                       f"{args.dataset}_blackbox")
@@ -196,13 +207,15 @@ def main() -> None:
         n_repeats=args.n_repeats, n_samples=args.n_samples,
     )
     model = ConceptMemoryReasonerTS(
-        input_size=input_size, annotations=annotations, task_names=task_names,
-        n_rules=2, snf_config=SNFConfig(max_horizon=horizon), **encoder,
+        input_size=input_size, annotations=annotations, task_names=task_names, n_rules=2,
+        snf_config=SNFConfig(max_horizon=horizon, templates=templates, discrete=args.discrete),
+        selection=args.discrete, **encoder,
     )
     learner, trainer = fit(
         model, args, loaders, f"{args.dataset}_cmr",
         callbacks=[TemporalCMRMonitor(every_n_epochs=max(1, args.epochs // 4)), report],
         concept_source=args.concept_source,
+        concept_pos_weight=concept_pos_weight(loaders[0]) if args.pos_weight else None,
     )
     trainer.test(learner, loaders[2], verbose=False)
     print("\n######## soft rules (the trained model as is)")

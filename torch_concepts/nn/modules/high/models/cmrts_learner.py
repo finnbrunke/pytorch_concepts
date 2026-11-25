@@ -23,7 +23,10 @@ class TemporalCMRLearner(pl.LightningModule):
     robustness is non-negative.
 
     Loss: task BCE + ``concept_weight`` × concept loss, where binary concepts
-    use BCE and continuous concepts MSE. A :class:`SequenceBlackBox` has no
+    use BCE and continuous concepts MSE. ``concept_pos_weight`` (one value
+    per concept, e.g. from :func:`concept_pos_weight`) up-weights the positive
+    steps of rare binary concepts, which per-step BCE otherwise learns to
+    predict as always absent. A :class:`SequenceBlackBox` has no
     concepts and trains on the task loss only.
 
     ``concept_source`` selects what the rule decoder sees during training:
@@ -45,6 +48,7 @@ class TemporalCMRLearner(pl.LightningModule):
         learning_rate: float = 3e-3,
         concept_weight: float = 1.0,
         concept_source: str = "predicted",
+        concept_pos_weight: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         if isinstance(model, ConceptMemoryReasonerTS) and model.rule_decoder is None:
@@ -59,6 +63,11 @@ class TemporalCMRLearner(pl.LightningModule):
         self.concept_source = concept_source
         labels = model.annotations.labels if model.annotations is not None else []
         types = [model.annotations.concept(name).type for name in labels]
+        if concept_pos_weight is not None:
+            concept_pos_weight = torch.as_tensor(concept_pos_weight, dtype=torch.float)
+            if concept_pos_weight.shape != (len(labels),):
+                raise ValueError(f"concept_pos_weight must have shape ({len(labels)},).")
+        self.register_buffer("concept_pos_weight", concept_pos_weight, persistent=False)
         self.register_buffer(
             "_binary_concepts",
             torch.tensor([kind == "binary" for kind in types], dtype=torch.bool),
@@ -88,9 +97,13 @@ class TemporalCMRLearner(pl.LightningModule):
         binary = self._binary_concepts
         losses = []
         if binary.any():
+            target = true[..., binary]
+            weight = None
+            if self.concept_pos_weight is not None:
+                weight = 1.0 + (self.concept_pos_weight[binary] - 1.0) * target
             losses.append(
                 F.binary_cross_entropy(
-                    predicted[..., binary].clamp(1e-6, 1 - 1e-6), true[..., binary]
+                    predicted[..., binary].clamp(1e-6, 1 - 1e-6), target, weight=weight
                 )
             )
         if (~binary).any():
@@ -178,3 +191,21 @@ class TemporalCMRLearner(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+
+
+@torch.no_grad()
+def concept_pos_weight(dataloader, max_weight: float = 50.0) -> torch.Tensor:
+    """``(1 - p) / p`` per concept from the training traces, capped at ``max_weight``.
+
+    ``p`` is the fraction of time steps where the concept is present. Use it
+    as ``TemporalCMRLearner(concept_pos_weight=...)``; only binary concepts
+    are weighted.
+    """
+    total = positives = None
+    for batch in dataloader:
+        concepts = TemporalCMRLearner.unpack(batch)[1]
+        flat = (concepts >= 0.5).float().reshape(-1, concepts.shape[-1])
+        positives = flat.sum(0) if positives is None else positives + flat.sum(0)
+        total = flat.shape[0] if total is None else total + flat.shape[0]
+    rate = positives / total
+    return ((1 - rate) / rate.clamp_min(1e-6)).clamp(1.0, max_weight)

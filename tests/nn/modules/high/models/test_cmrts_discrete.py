@@ -96,3 +96,53 @@ def test_discrete_rules_rejects_fixed_rules_and_bad_modes():
     with pytest.raises(ValueError):
         with discrete_rules(cmr(), concepts="max"):
             pass
+
+
+def test_straight_through_selection_picks_one_rule_and_trains_the_selector():
+    model = cmr(n_rules=3, selection="straight_through")
+    x, _ = batch()
+    out = model(x)  # training mode: Gumbel sample
+    assert set(out.rule_selection.flatten().tolist()) <= {0.0, 1.0}
+    assert torch.equal(out.rule_selection.sum(-1), torch.ones(32, 1))
+    out.tasks.tensor.sum().backward()
+    assert model.rule_selector.weight.grad.abs().sum() > 0
+    model.eval()
+    with torch.no_grad():
+        logits = model.rule_selector(model._pool(model.encoder(x))).reshape(32, 1, 3)
+        assert torch.equal(model(x).rule_selection.argmax(-1), logits.argmax(-1))
+    with pytest.raises(ValueError, match="selection"):
+        cmr(selection="gumbel")
+
+
+def test_bidirectional_encoder_keeps_the_latent_size():
+    from torch_concepts.nn import SequenceEncoder
+
+    encoder = SequenceEncoder(2, 16, kind="gru", bidirectional=True)
+    assert encoder(torch.randn(3, 7, 2)).shape == (3, 7, 16)
+    # A bidirectional step depends on later inputs.
+    x = torch.randn(1, 7, 2, requires_grad=True)
+    encoder(x)[0, 0].sum().backward()
+    assert x.grad[0, -1].abs().sum() > 0
+    with pytest.raises(ValueError, match="even"):
+        SequenceEncoder(2, 15, kind="lstm", bidirectional=True)
+    with pytest.raises(ValueError, match="only available"):
+        SequenceEncoder(2, 16, kind="transformer", bidirectional=True)
+    assert cmr(encoder_bidirectional=True)(torch.randn(2, 20, 2)).tasks.tensor.shape == (2, 1)
+
+
+def test_concept_pos_weight_upweights_rare_positive_steps():
+    from torch_concepts.nn import TemporalCMRLearner, concept_pos_weight
+
+    loader = rule_dataset()
+    weight = concept_pos_weight(loader)
+    true = torch.cat([b["temporal_concepts"] for b in loader])
+    rate = true.mean((0, 1))
+    assert torch.allclose(weight, ((1 - rate) / rate).clamp(1, 50), atol=1e-4)
+
+    plain = TemporalCMRLearner(cmr())
+    weighted = TemporalCMRLearner(cmr(), concept_pos_weight=torch.tensor([9.0, 1.0]))
+    predicted = torch.full((1, 4, 2), 0.1)
+    target = torch.tensor([[[1.0, 1.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]])
+    assert weighted.concept_loss(predicted, target) > plain.concept_loss(predicted, target)
+    with pytest.raises(ValueError, match="shape"):
+        TemporalCMRLearner(cmr(), concept_pos_weight=torch.ones(3))

@@ -1,4 +1,15 @@
-"""Differentiable one-clause separated-normal-form rules."""
+"""Differentiable one-clause temporal rules (a learned rule bank).
+
+Each task-rule pair is one clause over two concept predicates ``A = c_a >
+theta_a`` and ``B = c_b > theta_b`` in one of the templates
+
+* ``always_implies_eventually``: ``G(A -> F_[a,b] B)``,
+* ``eventually_and_eventually``: ``F(A and F_[a,b] B)``,
+* ``always_not``: ``G(not A)``,
+
+chosen per rule among ``SNFConfig.templates``. The concepts, the template,
+the thresholds and the interval are learned.
+"""
 
 import math
 from dataclasses import dataclass
@@ -10,7 +21,9 @@ from torch import nn
 
 from .....annotations import Annotations
 from .....tensor import AnnotatedTensor
-from .operators import smooth_or
+from .operators import smooth_and, smooth_or
+
+TEMPLATES = ("always_implies_eventually", "eventually_and_eventually", "always_not")
 
 
 @dataclass(frozen=True)
@@ -29,6 +42,13 @@ class SNFConfig:
             not robustness units. Defaults to ``max_horizon / 20``.
         init_std: Standard deviation of the random parameter initialisation.
             A non-zero value breaks the symmetry between rules of one task.
+        templates: Rule templates a rule may take (see module docstring).
+            With more than one, each rule learns which one it is.
+        discrete: ``"soft"`` mixes concepts (and templates) with softmax
+            weights. ``"straight_through"`` uses hard one-hot Gumbel samples
+            in training (soft gradients, straight-through) and the argmax in
+            eval mode, so the trained model computes with discrete rules.
+        gumbel_temperature: Temperature of the Gumbel-softmax samples.
     """
 
     max_horizon: int = 40
@@ -38,6 +58,9 @@ class SNFConfig:
     min_interval: float = 1.0
     time_temperature: Optional[float] = None
     init_std: float = 1.0
+    templates: tuple = ("always_implies_eventually",)
+    discrete: str = "soft"
+    gumbel_temperature: float = 1.0
 
     def __post_init__(self):
         if self.max_horizon <= 0:
@@ -50,6 +73,14 @@ class SNFConfig:
             raise ValueError("time_temperature must be positive.")
         if self.init_std < 0:
             raise ValueError("init_std must be non-negative.")
+        templates = tuple(self.templates)
+        if not templates or len(set(templates)) != len(templates) or not set(templates) <= set(TEMPLATES):
+            raise ValueError(f"templates must be distinct entries of {TEMPLATES}.")
+        object.__setattr__(self, "templates", templates)
+        if self.discrete not in {"soft", "straight_through"}:
+            raise ValueError("discrete must be 'soft' or 'straight_through'.")
+        if self.gumbel_temperature <= 0:
+            raise ValueError("gumbel_temperature must be positive.")
 
     @property
     def resolved_time_temperature(self) -> float:
@@ -59,7 +90,7 @@ class SNFConfig:
 
 
 class SNFRuleDecoder(nn.Module):
-    """Learn a global bank of ``Always(A -> Eventually_[a,b](B))`` rules."""
+    """Learn a global bank of one-clause temporal rules (see module docstring)."""
 
     def __init__(
         self,
@@ -84,6 +115,13 @@ class SNFRuleDecoder(nn.Module):
         self.width_logits = nn.Parameter(torch.empty(interval_shape))
         self.antecedent_threshold_logits = nn.Parameter(torch.empty(shape))
         self.consequent_threshold_logits = nn.Parameter(torch.empty(shape))
+        self.templates = self.config.templates
+        if len(self.templates) > 1:
+            self.template_logits = nn.Parameter(
+                torch.empty(len(self.task_names), n_rules, len(self.templates))
+            )
+        else:
+            self.template_logits = None
         log_scale = torch.tensor(math.log(self.config.robustness_scale))
         if self.config.learn_robustness_scale:
             self.log_robustness_scale = nn.Parameter(log_scale)
@@ -106,6 +144,8 @@ class SNFRuleDecoder(nn.Module):
             self.consequent_threshold_logits,
         ):
             nn.init.normal_(parameter, std=0.25 * std)
+        if self.template_logits is not None:
+            nn.init.normal_(self.template_logits, std=0.25 * std)
 
     @property
     def robustness_scale(self) -> torch.Tensor:
@@ -123,13 +163,32 @@ class SNFRuleDecoder(nn.Module):
         end = start + min_width + available * torch.sigmoid(self.width_logits)
         return start, end
 
+    def choice(self, logits: torch.Tensor) -> torch.Tensor:
+        """Weights of a categorical choice (concepts or templates) over the last axis.
+
+        Softmax for ``discrete="soft"``. For ``"straight_through"``: a hard
+        one-hot Gumbel-softmax sample in training mode (gradients of the soft
+        sample) and the one-hot argmax in eval mode.
+        """
+        if self.config.discrete == "soft":
+            return torch.softmax(logits, dim=-1)
+        if self.training:
+            return F.gumbel_softmax(logits, tau=self.config.gumbel_temperature, hard=True, dim=-1)
+        return F.one_hot(logits.argmax(-1), logits.shape[-1]).to(logits.dtype)
+
+    def template_weights(self) -> torch.Tensor:
+        """``(tasks, rules, templates)`` weights of the rule templates."""
+        if self.template_logits is None:
+            return self.start_logits.new_ones(*self.start_logits.shape, 1)
+        return self.choice(self.template_logits)
+
     def _predicate(
         self,
         concepts: torch.Tensor,
         concept_logits: torch.Tensor,
         threshold_logits: torch.Tensor,
     ) -> torch.Tensor:
-        weights = torch.softmax(concept_logits, dim=-1)
+        weights = self.choice(concept_logits)
         thresholds = torch.sigmoid(threshold_logits)
         return (
             (
@@ -203,11 +262,22 @@ class SNFRuleDecoder(nn.Module):
             values, self.consequent_logits, self.consequent_threshold_logits
         )
         start, end = self._intervals()
-        future = self._eventually(consequent, start, end)
-        # Smooth max: with a hard max the consequent gets no gradient wherever
-        # the antecedent is false, which for sparse antecedents is almost always.
-        implication = smooth_or(-antecedent, future, beta=self.config.smoothness)
-        robustness = self._always(implication, end)
+        beta = self.config.smoothness
+        by_template = []
+        for template in self.templates:
+            if template == "always_not":
+                by_template.append(self._always(-antecedent, torch.zeros_like(end)))
+                continue
+            future = self._eventually(consequent, start, end)
+            if template == "always_implies_eventually":
+                # Smooth max: with a hard max the consequent gets no gradient
+                # wherever the antecedent is false (almost always if sparse).
+                by_template.append(self._always(smooth_or(-antecedent, future, beta), end))
+            else:  # eventually_and_eventually: outer F over the same steps as G
+                by_template.append(-self._always(-smooth_and(antecedent, future, beta), end))
+        robustness = (
+            torch.stack(by_template, dim=-1) * self.template_weights()[None]
+        ).sum(dim=-1)
         satisfaction = torch.sigmoid(self.robustness_scale * robustness)
         if rule_selection.shape != satisfaction.shape:
             raise ValueError(
@@ -222,6 +292,39 @@ class SNFRuleDecoder(nn.Module):
         )
         return AnnotatedTensor(tasks, task_annotations), robustness, satisfaction
 
+    @staticmethod
+    def _spec(name, task, kind, antecedent, consequent, interval) -> dict:
+        """A rule in the dataset rulebook format (also readable by STLRuleDecoder).
+
+        ``antecedent``/``consequent``/``interval`` are always present; the
+        kind-specific aliases (``first``/``second`` or ``predicate``) are added.
+        """
+        spec = {
+            "name": name, "task": task, "kind": kind,
+            "antecedent": antecedent, "consequent": consequent, "interval": interval,
+        }
+        if kind == "eventually_and_eventually":
+            spec.update(first=antecedent, second=consequent)
+        elif kind == "always_not":
+            spec["predicate"] = antecedent
+        return spec
+
+    @torch.no_grad()
+    def _choices(self, mode: str, generator=None) -> dict:
+        def pick(logits):
+            logits = logits.detach().cpu()
+            if mode == "argmax":
+                return logits.argmax(-1)
+            flat = logits.softmax(-1).reshape(-1, logits.shape[-1])
+            return torch.multinomial(flat, 1, generator=generator).reshape(logits.shape[:-1])
+
+        chosen = {role: pick(getattr(self, f"{role}_logits")) for role in ("antecedent", "consequent")}
+        chosen["template"] = (
+            pick(self.template_logits) if self.template_logits is not None
+            else torch.zeros(self.start_logits.shape, dtype=torch.long)
+        )
+        return chosen
+
     @torch.no_grad()
     def discrete_specs(
         self,
@@ -231,81 +334,70 @@ class SNFRuleDecoder(nn.Module):
     ) -> list[dict]:
         """One discrete rulebook from the bank, in the dataset rulebook format.
 
-        The concept of each antecedent/consequent is the most likely one
-        (``concepts="argmax"``) or drawn from its softmax distribution
-        (``"sample"``); thresholds are kept; intervals are rounded to integers
-        (the soft gates are centred half a step outside ``[start, end]``) and
-        ``end`` is capped at ``max_end``.
+        The concept of each antecedent/consequent and each rule's template are
+        the most likely ones (``concepts="argmax"``) or drawn from their
+        softmax distributions (``"sample"``); thresholds are kept; intervals
+        are rounded to integers (the soft gates are centred half a step
+        outside ``[start, end]``) and ``end`` is capped at ``max_end``.
         """
         if concepts not in {"argmax", "sample"}:
             raise ValueError("concepts must be 'argmax' or 'sample'.")
+        return self._discrete_rules(self._choices(concepts, generator), integer=True, max_end=max_end)
+
+    @torch.no_grad()
+    def export_rules(self) -> list[dict]:
+        """Return the learned bank as discrete, inspectable rule specs.
+
+        Most likely concepts and templates; continuous interval bounds.
+        """
+        return self._discrete_rules(self._choices("argmax"), integer=False)
+
+    def _discrete_rules(self, chosen: dict, integer: bool, max_end=None) -> list[dict]:
         start, end = self._intervals()
-        chosen = {}
-        for role in ("antecedent", "consequent"):
-            logits = getattr(self, f"{role}_logits").detach().cpu()
-            if concepts == "argmax":
-                chosen[role] = logits.argmax(-1)
-            else:
-                flat = logits.softmax(-1).reshape(-1, logits.shape[-1])
-                chosen[role] = torch.multinomial(flat, 1, generator=generator).reshape(
-                    logits.shape[:-1]
-                )
         thresholds = {
             role: getattr(self, f"{role}_threshold_logits").detach().sigmoid().cpu()
             for role in ("antecedent", "consequent")
         }
         specs = []
-        for task_index, task in enumerate(self.task_names):
-            for rule_index in range(self.n_rules):
-                lo = int(round(float(start[task_index, rule_index])))
-                hi = int(round(float(end[task_index, rule_index])))
-                if max_end is not None:
-                    hi, lo = min(hi, max_end), min(lo, max_end)
-                spec = {
-                    "name": f"learned_{task}_{rule_index}",
-                    "task": task,
-                    "kind": "always_implies_eventually",
-                    "interval": [lo, max(lo, hi)],
-                }
+        for k, task in enumerate(self.task_names):
+            for r in range(self.n_rules):
+                if integer:
+                    lo = int(round(float(start[k, r])))
+                    hi = int(round(float(end[k, r])))
+                    if max_end is not None:
+                        hi, lo = min(hi, max_end), min(lo, max_end)
+                    interval = [lo, max(lo, hi)]
+                else:
+                    interval = [float(start[k, r]), float(end[k, r])]
+                roles = {}
                 for role in ("antecedent", "consequent"):
-                    concept = int(chosen[role][task_index, rule_index])
-                    spec[role] = {
+                    concept = int(chosen[role][k, r])
+                    roles[role] = {
                         "concept": self.annotations.labels[concept],
-                        "threshold": float(thresholds[role][task_index, rule_index, concept]),
+                        "threshold": float(thresholds[role][k, r, concept]),
                     }
-                specs.append(spec)
+                kind = self.templates[int(chosen["template"][k, r])]
+                specs.append(self._spec(
+                    f"learned_{task}_{r}", task, kind, roles["antecedent"],
+                    roles["consequent"], interval,
+                ))
         return specs
 
-    @torch.no_grad()
-    def export_rules(self) -> list[dict]:
-        """Return the learned bank as discrete, inspectable rule specs."""
-        start, end = self._intervals()
-        antecedents = self.antecedent_logits.argmax(-1)
-        consequents = self.consequent_logits.argmax(-1)
-        thresholds_a = self.antecedent_threshold_logits.sigmoid()
-        thresholds_b = self.consequent_threshold_logits.sigmoid()
-        rules = []
-        for task_index, task in enumerate(self.task_names):
-            for rule_index in range(self.n_rules):
-                a = antecedents[task_index, rule_index].item()
-                b = consequents[task_index, rule_index].item()
-                rules.append(
-                    {
-                        "name": f"learned_{task}_{rule_index}",
-                        "task": task,
-                        "kind": "always_implies_eventually",
-                        "antecedent": {
-                            "concept": self.annotations.labels[a],
-                            "threshold": thresholds_a[task_index, rule_index, a].item(),
-                        },
-                        "consequent": {
-                            "concept": self.annotations.labels[b],
-                            "threshold": thresholds_b[task_index, rule_index, b].item(),
-                        },
-                        "interval": [
-                            start[task_index, rule_index].item(),
-                            end[task_index, rule_index].item(),
-                        ],
-                    }
-                )
-        return rules
+
+def format_rule(spec: dict) -> str:
+    """Readable STL for a rulebook entry, e.g. ``G(a > 0.50 -> F[1,4] b > 0.50)``."""
+    def atom(role):
+        part = spec.get(role) or spec.get({"antecedent": "first", "consequent": "second"}[role]) \
+            or spec.get("predicate")
+        return f"{part['concept']} > {part['threshold']:.2f}"
+
+    kind = spec["kind"]
+    if kind == "always_not":
+        return f"G(not {atom('antecedent')})"
+    start, end = spec["interval"]
+    window = f"F[{start:.0f},{end:.0f}]"
+    if kind == "always_implies_eventually":
+        return f"G({atom('antecedent')} -> {window} {atom('consequent')})"
+    if kind == "eventually_and_eventually":
+        return f"F({atom('antecedent')} and {window} {atom('consequent')})"
+    raise ValueError(f"Unknown rule kind {kind!r}.")

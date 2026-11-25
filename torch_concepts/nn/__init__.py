@@ -90,8 +90,8 @@ from .modules.high.models.cmrts import (
     discrete_rules,
     SequenceEncoder,
 )
-from .modules.high.rules.snf import SNFConfig, SNFRuleDecoder
-from .modules.high.models.cmrts_learner import TemporalCMRLearner
+from .modules.high.rules.snf import SNFConfig, SNFRuleDecoder, format_rule
+from .modules.high.models.cmrts_learner import TemporalCMRLearner, concept_pos_weight
 from .modules.high.models.cmrts_evaluation import (
     collect_predictions,
     concept_completeness,
@@ -237,7 +237,9 @@ __all__ = [
     "SequenceEncoder",
     "SNFConfig",
     "SNFRuleDecoder",
+    "format_rule",
     "TemporalCMRLearner",
+    "concept_pos_weight",
     "SequenceBlackBox",
     "discrete_rules",
     "collect_predictions",
