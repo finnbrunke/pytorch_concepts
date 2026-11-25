@@ -7,7 +7,6 @@ selection.
 """
 
 from dataclasses import dataclass
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -15,6 +14,8 @@ from torch import nn
 
 from .....annotations import Annotations
 from .....tensor import AnnotatedTensor
+from ..rules.operators import smooth_and, smooth_max, smooth_min, smooth_or
+from ..rules.snf import SNFConfig, SNFRuleDecoder
 
 
 class SequenceEncoder(nn.Module):
@@ -149,10 +150,11 @@ class STLRuleSpec:
 class STLRuleDecoder(nn.Module):
     """Evaluate a fixed STL rule bank and mix it into global task outputs.
 
-    Robustness is evaluated at the beginning of each trace.  Bounded
-    ``Always`` and ``Eventually`` operators use differentiable ``min`` and
-    ``max`` reductions over their temporal windows.  The decoder intentionally
-    has no learned formula construction in stage 1.
+    Robustness is evaluated at the beginning of each trace. ``Always``,
+    ``Eventually``, conjunction and implication use smooth min/max with inverse
+    temperature ``smoothness`` so every concept value receives a gradient;
+    ``smoothness=None`` gives exact hard STL semantics (as used for dataset
+    labels). The decoder has no learned formula construction.
     """
 
     def __init__(
@@ -160,11 +162,15 @@ class STLRuleDecoder(nn.Module):
         annotations: Annotations,
         task_names: List[str],
         rule_specs: List[Union[STLRuleSpec, dict]],
-        robustness_scale: float = 1.0,
+        robustness_scale: float = 5.0,
+        smoothness: Optional[float] = 10.0,
     ):
         super().__init__()
         if robustness_scale <= 0:
             raise ValueError("robustness_scale must be positive.")
+        if smoothness is not None and smoothness <= 0:
+            raise ValueError("smoothness must be positive or None.")
+        self.smoothness = smoothness
         self.annotations = annotations
         self.task_names = list(task_names)
         self.rules = [
@@ -186,34 +192,46 @@ class STLRuleDecoder(nn.Module):
             raise ValueError(f"Rule references unknown concept {name!r}.")
         return concepts[..., self._indices[name]] - float(spec.get("threshold", 0.0))
 
+    def _eventually(self, values: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        """``max(values[t + start : t + end + 1])`` for ``t <= T - 1 - end``.
+
+        Only time steps whose whole window fits in the trace are returned, the
+        same bounded semantics as the learned SNF decoder and the MIT-BIH labels.
+        """
+        if not 0 <= start <= end:
+            raise ValueError(f"Invalid interval [{start}, {end}].")
+        if end >= values.shape[-1]:
+            raise ValueError(
+                f"Interval end {end} does not fit a trace of length {values.shape[-1]}."
+            )
+        windows = values.unfold(-1, end + 1, 1)[..., start:]
+        return smooth_max(windows, beta=self.smoothness)
+
     @staticmethod
-    def _window(values: torch.Tensor, start: int, end: int, reduction: str) -> torch.Tensor:
-        length = max(1, end - start + 1)
-        values = values[..., start:]
-        if values.shape[-1] < length:
-            values = torch.nn.functional.pad(values, (0, length - values.shape[-1]), value=0.0)
-        windows = values.unfold(-1, length, 1)
-        reduced = windows.min(-1).values if reduction == "min" else windows.max(-1).values
-        return reduced[..., : max(1, min(end + 1, reduced.shape[-1]))]
+    def _interval(fields: dict, time: int) -> tuple[int, int]:
+        start, end = fields.get("interval", [0, time - 1])
+        return int(start), int(end)
 
     def _robustness(self, concepts: torch.Tensor, rule: STLRuleSpec) -> torch.Tensor:
         fields = rule.fields
         kind = rule.kind
+        time = concepts.shape[-2]
         if kind == "always_implies_eventually":
             antecedent = self._atom(concepts, fields["antecedent"])
             consequent = self._atom(concepts, fields["consequent"])
-            end = int(fields.get("interval", [0, concepts.shape[-1] - 1])[1])
-            future = self._window(consequent, 0, end, "max")
-            implication = torch.maximum(-antecedent[..., :future.shape[-1]], future)
-            return implication.min(dim=-1).values
+            future = self._eventually(consequent, *self._interval(fields, time))
+            beta = self.smoothness
+            implication = smooth_or(-antecedent[..., :future.shape[-1]], future, beta)
+            return smooth_min(implication, beta=beta)
         if kind == "eventually_and_eventually":
             first = self._atom(concepts, fields["first"])
             second = self._atom(concepts, fields["second"])
-            end = int(fields.get("interval", [0, concepts.shape[-1] - 1])[1])
-            future = self._window(second, 0, end, "max")
-            return torch.minimum(first[..., :future.shape[-1]], future).max(dim=-1).values
+            future = self._eventually(second, *self._interval(fields, time))
+            beta = self.smoothness
+            both = smooth_and(first[..., :future.shape[-1]], future, beta)
+            return smooth_max(both, beta=beta)
         if kind == "always_not":
-            return (-self._atom(concepts, fields["predicate"])).min(dim=-1).values
+            return smooth_min(-self._atom(concepts, fields["predicate"]), beta=self.smoothness)
         raise ValueError(f"Unknown STL rule kind {kind!r}.")
 
     def forward(
@@ -253,12 +271,12 @@ class STLRuleDecoder(nn.Module):
 
 
 class ConceptMemoryReasonerTS(nn.Module):
-    """Generic temporal representation for a future STL-based CMR decoder.
+    """Temporal CMR with fixed or differentiable STL rule decoding.
 
     Concepts are predicted at every time step. Rule selection is global: the
     sequence encoder is pooled over time and produces one rule distribution per
-    task and sequence. STL rule decoding is intentionally not implemented here;
-    future decoders can consume ``concepts`` and ``rule_selection``.
+    task and sequence.     Pass ``rule_specs`` for fixed rules or ``snf_config`` for globally learned
+    one-clause separated-normal-form rules.
 
     Args:
         input_size: Number of features at each time step.
@@ -270,6 +288,9 @@ class ConceptMemoryReasonerTS(nn.Module):
         encoder_kind: ``"gru"``, ``"lstm"``, ``"transformer"``, or ``"mlp"``.
         pooling: Temporal pooling for global rule selection: ``"mean"``,
             ``"max"``, or ``"last"``.
+        snf_config: Enables the differentiable SNF rule bank when provided.
+        stl_smoothness: Inverse temperature of the fixed rules' smooth min/max;
+            ``None`` evaluates them with exact hard semantics.
     """
 
     def __init__(
@@ -286,7 +307,9 @@ class ConceptMemoryReasonerTS(nn.Module):
         transformer_heads: int = 4,
         pooling: str = "mean",
         rule_specs: Optional[List[Union[STLRuleSpec, dict]]] = None,
-        robustness_scale: float = 1.0,
+        robustness_scale: float = 5.0,
+        snf_config: Optional[SNFConfig] = None,
+        stl_smoothness: Optional[float] = 10.0,
     ):
         super().__init__()
         if isinstance(task_names, str):
@@ -306,6 +329,8 @@ class ConceptMemoryReasonerTS(nn.Module):
         self.latent_size = latent_size
         self.pooling = pooling
         self.rule_specs = rule_specs
+        if rule_specs is not None and snf_config is not None:
+            raise ValueError("Choose rule_specs or snf_config, not both.")
         self.encoder = SequenceEncoder(
             input_size=input_size,
             latent_size=latent_size,
@@ -321,11 +346,19 @@ class ConceptMemoryReasonerTS(nn.Module):
             len(self.task_names) * n_rules,
         )
         self.rule_decoder = (
-            STLRuleDecoder(
+            SNFRuleDecoder(
+                annotations,
+                self.task_names,
+                n_rules,
+                snf_config,
+            )
+            if snf_config is not None
+            else STLRuleDecoder(
                 annotations,
                 self.task_names,
                 rule_specs,
                 robustness_scale=robustness_scale,
+                smoothness=stl_smoothness,
             )
             if rule_specs is not None
             else None

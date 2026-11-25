@@ -60,7 +60,7 @@ from .modules.loss import PyCLoss, ConceptLoss, ConceptSubset, WeightedConceptLo
     MSEReconstructionLoss, KLDivergenceLoss, OrthogonalityLoss, NLLProbLoss
 
 # Training callbacks
-from .modules.callbacks import LossWeightWarmup
+from .modules.callbacks import LossWeightWarmup, TemporalCMRMonitor
 
 # Metrics
 from .modules.metrics import ConceptMetrics, compute_cace
@@ -84,6 +84,8 @@ from .modules.high.models.cmrts import (
     STLRuleSpec,
     SequenceEncoder,
 )
+from .modules.high.rules.snf import SNFConfig, SNFRuleDecoder
+from .modules.high.models.cmrts_learner import TemporalCMRLearner
 
 # Models (mid-level)
 from .modules.mid.factors.factor import ParametricFactor
@@ -205,9 +207,13 @@ __all__ = [
     "STLRuleDecoder",
     "STLRuleSpec",
     "SequenceEncoder",
+    "SNFConfig",
+    "SNFRuleDecoder",
+    "TemporalCMRLearner",
 
     # Training callbacks
     "LossWeightWarmup",
+    "TemporalCMRMonitor",
 
     # Metrics
     "ConceptMetrics",

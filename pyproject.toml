@@ -55,6 +55,10 @@ docs = [
     "myst-nb",
     "sphinx-hoverxref",
 ]
+tracking = [
+    "matplotlib",
+    "wandb",
+]
 conceptarium = [
     "hydra-core",
     "hydra-list-sweeper",

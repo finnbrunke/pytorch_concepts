@@ -209,3 +209,29 @@ def test_cmr_composite_loss_matches_explicit_value_and_gradients():
         assert (actual_gradient is None) == (expected_gradient is None)
         if actual_gradient is not None:
             assert torch.equal(actual_gradient, expected_gradient)
+
+
+def test_fixed_stl_rules_spread_gradients_over_time_unless_hard():
+    from torch_concepts import AnnotatedTensor, Annotations
+    from torch_concepts.nn import STLRuleDecoder
+
+    annotations = Annotations(labels=["a", "b"], cardinalities=[1, 1])
+    rule = {
+        "name": "r", "task": "t", "kind": "always_implies_eventually",
+        "antecedent": {"concept": "a", "threshold": 0.5},
+        "consequent": {"concept": "b", "threshold": 0.5},
+        "interval": [1, 4],
+    }
+    counts = {}
+    for smoothness in (None, 10.0):
+        values = torch.rand(1, 20, 2, requires_grad=True)
+        decoder = STLRuleDecoder(annotations, ["t"], [rule], smoothness=smoothness)
+        _, robustness, _ = decoder(
+            AnnotatedTensor(values, annotations.to_concept_space(), axis=-1),
+            torch.ones(1, 1, 1),
+        )
+        robustness.sum().backward()
+        counts[smoothness] = int((values.grad.abs() > 0).sum())
+
+    assert counts[None] <= 2
+    assert counts[10.0] > 20

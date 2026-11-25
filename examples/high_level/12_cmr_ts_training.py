@@ -1,111 +1,106 @@
-"""Small end-to-end training example for the temporal CMR model.
+"""Small end-to-end training example for learned temporal CMR rules.
 
 Run from the repository root:
 
     python -m examples.high_level.12_cmr_ts_training
+    python -m examples.high_level.12_cmr_ts_training --wandb            # log to W&B
+    python -m examples.high_level.12_cmr_ts_training --wandb --offline  # sync later
 
-The example generates a small predator-prey dataset, trains a compact GRU
-with the fixed named STL rule bank, and applies it to a held-out sequence.
+The example generates predator-prey data, learns one-clause SNF rules, and
+applies them to held-out sequences. Without ``--wandb``, metrics are written as
+CSV and figures as PNG files under ``lightning_logs/``.
 """
 
-import torch
-from pytorch_lightning import LightningModule, Trainer
+import argparse
+
+from pytorch_lightning import Trainer
+from pytorch_lightning.loggers import CSVLogger
 from torch.utils.data import DataLoader, Subset
 
 from torch_concepts import seed_everything
 from torch_concepts.data.datasets.predator_prey import PredatorPreyDataset
-from torch_concepts.nn import ConceptMemoryReasonerTS
+from torch_concepts.nn import (
+    ConceptMemoryReasonerTS,
+    SNFConfig,
+    TemporalCMRLearner,
+    TemporalCMRMonitor,
+)
 
 
-class TemporalCMRLightning(LightningModule):
-    """Lightning training wrapper for the plain CMR-TS module."""
+def make_logger(args, name: str):
+    if not args.wandb:
+        return CSVLogger("lightning_logs", name=name)
+    try:
+        from pytorch_lightning.loggers import WandbLogger
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("--wandb requires: pip install wandb") from exc
+    return WandbLogger(
+        project=args.wandb_project, name=name, offline=args.offline,
+        save_dir="lightning_logs",  # keeps ./wandb out of the repository root
+    )
 
-    def __init__(self, model: ConceptMemoryReasonerTS, learning_rate: float = 3e-3):
-        super().__init__()
-        self.model = model
-        self.learning_rate = learning_rate
 
-    def forward(self, inputs: torch.Tensor):
-        return self.model(inputs)
-
-    @staticmethod
-    def _targets(batch) -> torch.Tensor:
-        return (batch["robustness"] >= 0).float()
-
-    def training_step(self, batch, batch_idx):
-        output = self(batch["inputs"]["x"].float())
-        loss = torch.nn.functional.binary_cross_entropy(
-            output.tasks.tensor,
-            self._targets(batch),
+def print_summary(learner: TemporalCMRLearner) -> None:
+    print("\nlearned rules:")
+    for rule in learner.model.rule_decoder.export_rules():
+        antecedent, consequent = rule["antecedent"], rule["consequent"]
+        start, end = rule["interval"]
+        print(
+            f"  {rule['task']:<24} G({antecedent['concept']} > {antecedent['threshold']:.2f}"
+            f" -> F[{start:.0f},{end:.0f}] {consequent['concept']} > {consequent['threshold']:.2f})"
         )
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
+    print("\ntest metrics (majority-class accuracy in brackets):")
+    for task, values in learner.test_metrics.items():
+        auroc = f"{values['auroc']:.3f}" if "auroc" in values else "  n/a"
+        print(
+            f"  {task:<24} acc={values['acc']:.3f} [{values['majority_acc']:.3f}]"
+            f"  f1={values['f1']:.3f}  auroc={auroc}"
+        )
 
-    def test_step(self, batch, batch_idx):
-        output = self(batch["inputs"]["x"].float())
-        target = self._targets(batch).bool()
-        prediction = output.tasks.tensor.ge(0.5)
-        self.log("test_accuracy", (prediction == target).float().mean())
 
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--wandb", action="store_true", help="log to Weights & Biases")
+    parser.add_argument("--wandb-project", default="cmr-ts")
+    parser.add_argument("--offline", action="store_true", help="W&B offline mode")
+    parser.add_argument("--plot-every", type=int, default=5, help="figure frequency (epochs)")
+    return parser.parse_args()
 
 
 def main() -> None:
+    args = parse_args()
     seed_everything(7)
 
-    dataset = PredatorPreyDataset(num_samples=96, time_steps=40, dt=0.1)
-    split = int(0.8 * len(dataset))
-    trainset = Subset(dataset, range(split))
-    testset = Subset(dataset, range(split, len(dataset)))
-    train_loader = DataLoader(
-        trainset,
-        batch_size=16,
-        shuffle=True,
-        collate_fn=dataset.collate,
-    )
-    test_loader = DataLoader(
-        testset,
-        batch_size=len(testset),
-        collate_fn=dataset.collate,
-    )
+    dataset = PredatorPreyDataset(num_samples=120, time_steps=40, dt=0.1)
+    train_end, val_end = 80, 100
+    loader = dict(collate_fn=dataset.collate)
+    train_loader = DataLoader(Subset(dataset, range(train_end)), batch_size=16, shuffle=True, **loader)
+    val_loader = DataLoader(Subset(dataset, range(train_end, val_end)), batch_size=20, **loader)
+    test_loader = DataLoader(Subset(dataset, range(val_end, len(dataset))), batch_size=20, **loader)
 
     model = ConceptMemoryReasonerTS(
         input_size=2,
         annotations=dataset.concept_annotations,
         task_names=["prey_recovery", "predator_crash", "system_stability"],
-        n_rules=1,
+        n_rules=2,
         latent_size=16,
         encoder_kind="gru",
-        rule_specs=dataset.rulebook,
+        snf_config=SNFConfig(max_horizon=40),
     )
-    lightning_model = TemporalCMRLightning(model)
+    learner = TemporalCMRLearner(model, learning_rate=3e-3, concept_weight=1.0)
     trainer = Trainer(
-        max_epochs=8,
-        logger=False,
+        max_epochs=args.epochs,
+        logger=make_logger(args, "predator_prey"),
+        callbacks=[TemporalCMRMonitor(every_n_epochs=args.plot_every)],
+        log_every_n_steps=1,
         enable_checkpointing=False,
         enable_model_summary=False,
     )
-    trainer.fit(lightning_model, train_dataloaders=train_loader)
-    trainer.test(lightning_model, dataloaders=test_loader, verbose=False)
-
-    lightning_model.eval()
-    with torch.no_grad():
-        batch = next(iter(test_loader))
-        output = lightning_model(batch["inputs"]["x"].float())
-        predicted = output.tasks.tensor >= 0.5
-        target = batch["robustness"] >= 0
-        accuracy = (predicted == target).float().mean().item()
-
-    print("\nheld-out example")
-    print("concept names:", batch["concept_names"])
-    print("concept trace shape:", tuple(output.concepts.shape))
-    print("rule robustness:", output.rule_robustness[0].tolist())
-    print("rule satisfaction:", output.rule_satisfaction[0].tolist())
-    print("rule names:", [rule["name"] for rule in dataset.rulebook])
-    print("task probabilities:", output.tasks.tensor[0].tolist())
-    print("target / prediction:", target[0].tolist(), predicted[0].tolist())
-    print(f"held-out accuracy: {accuracy:.3f}")
+    trainer.fit(learner, train_loader, val_loader)
+    trainer.test(learner, test_loader, verbose=False)
+    print_summary(learner)
+    print(f"\nlogs and figures: {trainer.log_dir or 'W&B run'}")
 
 
 if __name__ == "__main__":
