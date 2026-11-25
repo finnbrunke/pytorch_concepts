@@ -266,3 +266,39 @@ def plot_rule_history(
         ax.set_xlabel("epoch", fontsize=7, color=MUTED)
     figure.tight_layout()
     return figure
+
+
+def plot_intervention_curves(curves: dict, scorer: str = "AUROC", title: str = "concept interventions"):
+    """Task score vs. amount of ground truth given to the concept traces.
+
+    Left: whole traces of ``k`` concepts; right: a fraction of the time steps
+    of every concept. Each panel shows the random order (mean over repeats)
+    and the uncertainty order (least certain first).
+
+    Args:
+        curves: ``report["interventions"]["curves"]`` from
+            :func:`interpretability_report`: keys ``concepts_random``,
+            ``concepts_uncertainty``, ``time_random``, ``time_uncertainty``.
+    """
+    figure = _new_figure(8.0, 3.0)
+    axes = figure.subplots(1, 2, sharey=True)
+    panels = (
+        ("concepts", "concepts intervened on (whole traces)"),
+        ("time", "fraction of time steps intervened on"),
+    )
+    for ax, (kind, label) in zip(axes, panels):
+        _style(ax)
+        for slot, order in enumerate(("random", "uncertainty")):
+            curve = curves.get(f"{kind}_{order}")
+            if curve is None:
+                continue
+            ax.plot(
+                curve["x"], curve["score"], color=SERIES[slot], linewidth=2,
+                marker="o", markersize=4, label=f"{order}  (area {curve['auc']:.3f})",
+            )
+        ax.set_xlabel(label, fontsize=7, color=MUTED)
+        ax.legend(fontsize=7, frameon=False, loc="lower right")
+    axes[0].set_ylabel(f"task {scorer} (macro)", fontsize=7, color=MUTED)
+    figure.suptitle(title, fontsize=9, color=INK, x=0.01, ha="left")
+    figure.tight_layout()
+    return figure

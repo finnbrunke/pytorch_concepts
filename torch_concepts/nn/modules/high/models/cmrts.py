@@ -6,6 +6,7 @@ decoder: sequence encoding, per-time-step concept annotation, and global rule
 selection.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
@@ -115,8 +116,8 @@ class CMRTemporalOutput:
     """Outputs of the temporal representation and global STL classifier."""
 
     latent: torch.Tensor
-    concepts: AnnotatedTensor
-    rule_selection: torch.Tensor
+    concepts: Optional[AnnotatedTensor]
+    rule_selection: Optional[torch.Tensor]
     rule_robustness: Optional[torch.Tensor] = None
     rule_satisfaction: Optional[torch.Tensor] = None
     tasks: Optional[AnnotatedTensor] = None
@@ -326,6 +327,7 @@ class ConceptMemoryReasonerTS(nn.Module):
             )
 
         self.n_rules = n_rules
+        self._discrete = None  # set by discrete_rules()
         self.latent_size = latent_size
         self.pooling = pooling
         self.rule_specs = rule_specs
@@ -383,7 +385,23 @@ class ConceptMemoryReasonerTS(nn.Module):
             return latent.max(dim=1).values
         return latent[:, -1]
 
-    def forward(self, inputs: torch.Tensor) -> CMRTemporalOutput:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        concept_values: Optional[torch.Tensor] = None,
+    ) -> CMRTemporalOutput:
+        """Predict concept traces, rule selection and tasks.
+
+        Args:
+            inputs: ``(batch, time, features)``.
+            concept_values: Optional ``(batch, time, concepts)`` traces (e.g.
+                ground truth) that replace the predicted concepts as input to
+                the rule decoder. ``output.concepts`` still holds the
+                predictions, so a concept loss can be computed; the rule
+                selection still comes from ``inputs``. This gives the
+                "independent" training mode of concept bottleneck models and
+                evaluation on ground-truth concepts.
+        """
         latent = self.encoder(inputs)
         concepts = AnnotatedTensor(
             self._concept_probabilities(self.concept_head(latent)),
@@ -397,10 +415,26 @@ class ConceptMemoryReasonerTS(nn.Module):
             self.n_rules,
         )
         selector = torch.softmax(selector_logits, dim=-1)
+        decoder_concepts = concepts
+        if concept_values is not None:
+            if concept_values.shape != concepts.shape:
+                raise ValueError(
+                    f"concept_values must have shape {tuple(concepts.shape)}, "
+                    f"got {tuple(concept_values.shape)}."
+                )
+            decoder_concepts = AnnotatedTensor(
+                concept_values.to(concepts.tensor.dtype),
+                self.annotations.to_concept_space(),
+                axis=-1,
+            )
         tasks = None
-        if self.rule_decoder is not None:
+        if self._discrete is not None:
+            selector, rule_robustness, rule_satisfaction, tasks = self._discrete(
+                decoder_concepts, selector
+            )
+        elif self.rule_decoder is not None:
             tasks, rule_robustness, rule_satisfaction = self.rule_decoder(
-                concepts, selector
+                decoder_concepts, selector
             )
         else:
             rule_robustness = None
@@ -412,4 +446,157 @@ class ConceptMemoryReasonerTS(nn.Module):
             rule_robustness=rule_robustness,
             rule_satisfaction=rule_satisfaction,
             tasks=tasks,
+        )
+
+
+class _DiscreteRules:
+    """Exact evaluation of one discrete rulebook with discrete rule selection."""
+
+    def __init__(self, model, specs, selection, generator):
+        self.model = model
+        self.specs = specs
+        self.selection = selection
+        self.generator = generator
+        self._decoders = {}
+
+    def _decoder(self, time: int, device) -> "STLRuleDecoder":
+        if time not in self._decoders:
+            specs = []
+            for spec in self.specs:
+                start, end = spec["interval"]
+                end = min(end, time - 1)
+                specs.append(dict(spec, interval=[min(start, end), end]))
+            self._decoders[time] = STLRuleDecoder(
+                self.model.annotations, self.model.task_names, specs, smoothness=None
+            ).to(device)
+        return self._decoders[time]
+
+    def select(self, selector: torch.Tensor) -> torch.Tensor:
+        if self.selection == "soft":
+            return selector
+        if self.selection == "top":
+            choice = selector.argmax(-1)
+        else:
+            flat = selector.detach().cpu().reshape(-1, selector.shape[-1])
+            choice = torch.multinomial(flat, 1, generator=self.generator).reshape(
+                selector.shape[:-1]
+            ).to(selector.device)
+        return torch.nn.functional.one_hot(choice, selector.shape[-1]).to(selector.dtype)
+
+    def __call__(self, concepts: AnnotatedTensor, selector: torch.Tensor):
+        selector = self.select(selector)
+        decoder = self._decoder(concepts.shape[-2], selector.device)
+        _, robustness, _ = decoder(concepts, selector)
+        scale = self.model.rule_decoder.robustness_scale.detach()
+        satisfaction = torch.sigmoid(scale * robustness)
+        tasks = (selector * satisfaction).sum(-1)
+        task_annotations = Annotations(
+            labels=self.model.task_names,
+            cardinalities=[1] * len(self.model.task_names),
+            types=["binary"] * len(self.model.task_names),
+        )
+        return selector, robustness, satisfaction, AnnotatedTensor(tasks, task_annotations)
+
+
+@contextmanager
+def discrete_rules(
+    model: "ConceptMemoryReasonerTS",
+    concepts: str = "argmax",
+    selection: str = "top",
+    seed: int = 0,
+):
+    """Inside the block, ``model`` computes exactly with discrete rules.
+
+    The learned SNF bank is replaced by one discrete rulebook
+    (:meth:`SNFRuleDecoder.discrete_specs`; ``concepts="argmax"`` or
+    ``"sample"``, drawn once on entry), evaluated with exact STL semantics,
+    and the rule selection becomes one rule per sample (``selection="top"``
+    or ``"sample"``, drawn at every forward call) or stays ``"soft"``. The
+    concept head and the selector are unchanged, so concept and rule
+    interventions work as usual inside the block.
+
+    Yields:
+        The discrete rulebook (a list of rule specs).
+    """
+    from ..rules.snf import SNFRuleDecoder
+
+    if not isinstance(model.rule_decoder, SNFRuleDecoder):
+        raise TypeError("discrete_rules needs a model with a learned SNF rule bank.")
+    if selection not in {"top", "sample", "soft"}:
+        raise ValueError("selection must be 'top', 'sample' or 'soft'.")
+    generator = torch.Generator().manual_seed(seed)
+    specs = model.rule_decoder.discrete_specs(concepts, generator)
+    previous = model._discrete
+    model._discrete = _DiscreteRules(model, specs, selection, generator)
+    try:
+        yield specs
+    finally:
+        model._discrete = previous
+
+
+class SequenceBlackBox(nn.Module):
+    """Concept-free baseline: the same encoder with a direct task head.
+
+    ``(batch, time, features)`` -> encoder -> temporal pooling -> MLP ->
+    task probabilities. It is the reference for concept completeness: the
+    temporal CMR with the same encoder settings should match it if the
+    concepts and rules lose no task-relevant information.
+
+    Returns a :class:`CMRTemporalOutput` with ``concepts=None``, so it trains
+    with :class:`TemporalCMRLearner` (task loss only).
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        task_names: Union[List[str], str],
+        latent_size: int = 64,
+        encoder_kind: str = "gru",
+        encoder_hidden_size: Optional[int] = None,
+        encoder_layers: int = 1,
+        encoder_dropout: float = 0.0,
+        transformer_heads: int = 4,
+        pooling: str = "mean",
+        head_hidden_size: Optional[int] = None,
+    ):
+        super().__init__()
+        if isinstance(task_names, str):
+            task_names = [task_names]
+        if pooling not in {"mean", "max", "last"}:
+            raise ValueError("pooling must be 'mean', 'max', or 'last'.")
+        self.task_names = list(task_names)
+        self.pooling = pooling
+        self.annotations = None
+        self.rule_decoder = None
+        self.encoder = SequenceEncoder(
+            input_size=input_size,
+            latent_size=latent_size,
+            kind=encoder_kind,
+            hidden_size=encoder_hidden_size,
+            num_layers=encoder_layers,
+            dropout=encoder_dropout,
+            n_heads=transformer_heads,
+        )
+        hidden = head_hidden_size or latent_size
+        self.head = nn.Sequential(
+            nn.Linear(latent_size, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, len(self.task_names)),
+        )
+        self._task_annotations = Annotations(
+            labels=self.task_names,
+            cardinalities=[1] * len(self.task_names),
+            types=["binary"] * len(self.task_names),
+        )
+
+    _pool = ConceptMemoryReasonerTS._pool
+
+    def forward(self, inputs: torch.Tensor, concept_values=None) -> CMRTemporalOutput:
+        latent = self.encoder(inputs)
+        tasks = torch.sigmoid(self.head(self._pool(latent)))
+        return CMRTemporalOutput(
+            latent=latent,
+            concepts=None,
+            rule_selection=None,
+            tasks=AnnotatedTensor(tasks, self._task_annotations),
         )

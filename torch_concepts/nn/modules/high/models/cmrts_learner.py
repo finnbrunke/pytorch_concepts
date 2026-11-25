@@ -1,6 +1,6 @@
 """Lightning training wrapper for :class:`ConceptMemoryReasonerTS`."""
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import pytorch_lightning as pl
 import torch
@@ -11,7 +11,7 @@ from torchmetrics.functional.classification import (
     binary_f1_score,
 )
 
-from .cmrts import CMRTemporalOutput, ConceptMemoryReasonerTS
+from .cmrts import CMRTemporalOutput, ConceptMemoryReasonerTS, SequenceBlackBox
 
 
 class TemporalCMRLearner(pl.LightningModule):
@@ -23,7 +23,14 @@ class TemporalCMRLearner(pl.LightningModule):
     robustness is non-negative.
 
     Loss: task BCE + ``concept_weight`` × concept loss, where binary concepts
-    use BCE and continuous concepts MSE.
+    use BCE and continuous concepts MSE. A :class:`SequenceBlackBox` has no
+    concepts and trains on the task loss only.
+
+    ``concept_source`` selects what the rule decoder sees during training:
+    ``"predicted"`` (joint training) or ``"ground_truth"`` (independent
+    training: rules are learned from true concept traces, while the concept
+    head is trained by its own loss). Validation and test always decode from
+    predicted concepts.
 
     Logged per stage (``train``/``val``/``test``), per epoch:
     ``{stage}/loss``, ``{stage}/task_loss``, ``{stage}/concept_loss``, and per
@@ -34,20 +41,27 @@ class TemporalCMRLearner(pl.LightningModule):
 
     def __init__(
         self,
-        model: ConceptMemoryReasonerTS,
+        model: Union[ConceptMemoryReasonerTS, SequenceBlackBox],
         learning_rate: float = 3e-3,
         concept_weight: float = 1.0,
+        concept_source: str = "predicted",
     ):
         super().__init__()
-        if model.rule_decoder is None:
+        if isinstance(model, ConceptMemoryReasonerTS) and model.rule_decoder is None:
             raise ValueError("The model needs rule_specs or snf_config to predict tasks.")
+        if concept_source not in {"predicted", "ground_truth"}:
+            raise ValueError("concept_source must be 'predicted' or 'ground_truth'.")
+        if concept_source == "ground_truth" and model.annotations is None:
+            raise ValueError("concept_source='ground_truth' needs a model with concepts.")
         self.model = model
         self.learning_rate = learning_rate
         self.concept_weight = concept_weight
-        types = [model.annotations.concept(name).type for name in model.annotations.labels]
+        self.concept_source = concept_source
+        labels = model.annotations.labels if model.annotations is not None else []
+        types = [model.annotations.concept(name).type for name in labels]
         self.register_buffer(
             "_binary_concepts",
-            torch.tensor([kind == "binary" for kind in types]),
+            torch.tensor([kind == "binary" for kind in types], dtype=torch.bool),
             persistent=False,
         )
         self._epoch_outputs: Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
@@ -56,8 +70,8 @@ class TemporalCMRLearner(pl.LightningModule):
     def task_names(self) -> List[str]:
         return self.model.task_names
 
-    def forward(self, inputs: torch.Tensor) -> CMRTemporalOutput:
-        return self.model(inputs)
+    def forward(self, inputs: torch.Tensor, concept_values=None) -> CMRTemporalOutput:
+        return self.model(inputs, concept_values=concept_values)
 
     @staticmethod
     def unpack(batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -85,10 +99,14 @@ class TemporalCMRLearner(pl.LightningModule):
 
     def _step(self, batch, stage: str) -> torch.Tensor:
         inputs, concepts, targets = self.unpack(batch)
-        output = self(inputs)
+        independent = stage == "train" and self.concept_source == "ground_truth"
+        output = self(inputs, concept_values=concepts if independent else None)
         probabilities = output.tasks.tensor
         task_loss = F.binary_cross_entropy(probabilities.clamp(1e-6, 1 - 1e-6), targets)
-        concept_loss = self.concept_loss(output.concepts.tensor, concepts)
+        if output.concepts is None:
+            concept_loss = task_loss.new_zeros(())
+        else:
+            concept_loss = self.concept_loss(output.concepts.tensor, concepts)
         loss = task_loss + self.concept_weight * concept_loss
         size = inputs.shape[0]
         options = dict(on_step=False, on_epoch=True, batch_size=size)

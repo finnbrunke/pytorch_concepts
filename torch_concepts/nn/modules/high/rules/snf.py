@@ -157,8 +157,11 @@ class SNFRuleDecoder(nn.Module):
         windows = F.pad(values, (0, horizon - 1)).unfold(-1, horizon, 1)
         positions = torch.arange(time, device=values.device)
         valid = (positions[:, None] + offsets.long()[None, :]) < time
-        gates = torch.sigmoid((offsets - start[..., None]) / temperature)
-        gates = gates * torch.sigmoid((end[..., None] - offsets) / temperature)
+        # Gates are centred half a step outside [start, end], so an integer
+        # offset is (softly) inside exactly when it rounds into the interval;
+        # this matches the exported discrete interval [round(start), round(end)].
+        gates = torch.sigmoid((offsets - start[..., None] + 0.5) / temperature)
+        gates = gates * torch.sigmoid((end[..., None] - offsets + 0.5) / temperature)
         gates = gates[None, :, :, None, :]
         floor = values.detach().amin(dim=-1, keepdim=True).unsqueeze(-1) - 1.0
         gated = gates * windows + (1.0 - gates) * floor
@@ -218,6 +221,60 @@ class SNFRuleDecoder(nn.Module):
             types=["binary"] * len(self.task_names),
         )
         return AnnotatedTensor(tasks, task_annotations), robustness, satisfaction
+
+    @torch.no_grad()
+    def discrete_specs(
+        self,
+        concepts: str = "argmax",
+        generator: Optional[torch.Generator] = None,
+        max_end: Optional[int] = None,
+    ) -> list[dict]:
+        """One discrete rulebook from the bank, in the dataset rulebook format.
+
+        The concept of each antecedent/consequent is the most likely one
+        (``concepts="argmax"``) or drawn from its softmax distribution
+        (``"sample"``); thresholds are kept; intervals are rounded to integers
+        (the soft gates are centred half a step outside ``[start, end]``) and
+        ``end`` is capped at ``max_end``.
+        """
+        if concepts not in {"argmax", "sample"}:
+            raise ValueError("concepts must be 'argmax' or 'sample'.")
+        start, end = self._intervals()
+        chosen = {}
+        for role in ("antecedent", "consequent"):
+            logits = getattr(self, f"{role}_logits").detach().cpu()
+            if concepts == "argmax":
+                chosen[role] = logits.argmax(-1)
+            else:
+                flat = logits.softmax(-1).reshape(-1, logits.shape[-1])
+                chosen[role] = torch.multinomial(flat, 1, generator=generator).reshape(
+                    logits.shape[:-1]
+                )
+        thresholds = {
+            role: getattr(self, f"{role}_threshold_logits").detach().sigmoid().cpu()
+            for role in ("antecedent", "consequent")
+        }
+        specs = []
+        for task_index, task in enumerate(self.task_names):
+            for rule_index in range(self.n_rules):
+                lo = int(round(float(start[task_index, rule_index])))
+                hi = int(round(float(end[task_index, rule_index])))
+                if max_end is not None:
+                    hi, lo = min(hi, max_end), min(lo, max_end)
+                spec = {
+                    "name": f"learned_{task}_{rule_index}",
+                    "task": task,
+                    "kind": "always_implies_eventually",
+                    "interval": [lo, max(lo, hi)],
+                }
+                for role in ("antecedent", "consequent"):
+                    concept = int(chosen[role][task_index, rule_index])
+                    spec[role] = {
+                        "concept": self.annotations.labels[concept],
+                        "threshold": float(thresholds[role][task_index, rule_index, concept]),
+                    }
+                specs.append(spec)
+        return specs
 
     @torch.no_grad()
     def export_rules(self) -> list[dict]:

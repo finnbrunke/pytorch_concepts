@@ -283,26 +283,92 @@ class TemporalCMRMonitor(pl.Callback):
         self._emit(trainer, "plots/rule_history", figure, self.history["epoch"][-1])
 
     def _emit(self, trainer, key: str, figure, epoch: int) -> None:
-        from pathlib import Path
+        emit_figure(trainer, key, figure, epoch, self.save_dir)
 
-        from .high.rules.plotting import figure_to_array
 
-        image = figure_to_array(figure)
-        handled = False
-        for logger in trainer.loggers:
-            if hasattr(logger, "log_image"):  # WandbLogger
-                logger.log_image(key=key, images=[image], step=trainer.global_step)
-                handled = True
-            elif hasattr(getattr(logger, "experiment", None), "add_image"):  # TensorBoard
-                logger.experiment.add_image(
-                    key, image, global_step=trainer.global_step, dataformats="HWC"
-                )
-                handled = True
-        save_dir = self.save_dir
-        if save_dir is None and not handled:
-            save_dir = Path(trainer.log_dir or trainer.default_root_dir) / "plots"
-        if save_dir is not None:
-            path = Path(save_dir) / f"{key.split('/')[-1]}_epoch{epoch:03d}.png"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            figure.savefig(path, facecolor=figure.get_facecolor(), bbox_inches="tight")
-        figure.clear()
+def emit_figure(trainer, key: str, figure, epoch: int, save_dir=None) -> None:
+    """Send a matplotlib figure to every image-capable logger of ``trainer``.
+
+    ``WandbLogger.log_image`` and TensorBoard ``add_image`` are supported. The
+    figure is also saved as ``<save_dir>/<name>_epoch<NNN>.png``; without a
+    ``save_dir`` it is saved to ``<log_dir>/plots`` only when no logger took it.
+    """
+    from pathlib import Path
+
+    from .high.rules.plotting import figure_to_array
+
+    image = figure_to_array(figure)
+    handled = False
+    for logger in trainer.loggers:
+        if hasattr(logger, "log_image"):  # WandbLogger
+            logger.log_image(key=key, images=[image], step=trainer.global_step)
+            handled = True
+        elif hasattr(getattr(logger, "experiment", None), "add_image"):  # TensorBoard
+            logger.experiment.add_image(
+                key, image, global_step=trainer.global_step, dataformats="HWC"
+            )
+            handled = True
+    if save_dir is None and not handled:
+        save_dir = Path(trainer.log_dir or trainer.default_root_dir) / "plots"
+    if save_dir is not None:
+        path = Path(save_dir) / f"{key.split('/')[-1]}_epoch{epoch:03d}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(path, facecolor=figure.get_facecolor(), bbox_inches="tight")
+    figure.clear()
+
+
+class TemporalInterpretabilityReport(pl.Callback):
+    """Run :func:`interpretability_report` on the test set after ``trainer.test``.
+
+    One report per entry of ``rule_modes`` (``"soft"``, ``"argmax"``,
+    ``"sample"``; see :func:`interpretability_report`), all on the same
+    trained model. Scalars go to every logger as ``interp/{mode}/...`` (see
+    :func:`flatten_report`); the intervention curves are plotted as
+    ``plots/intervention_curves_{mode}``. ``self.report`` maps each mode to
+    its nested report.
+
+    Args:
+        blackbox: A trained :class:`SequenceBlackBox` for concept completeness.
+        reference_rules: Rulebook for rule-language completeness.
+        rule_modes: Which models to evaluate. Discrete modes need an SNF bank.
+        save_dir: Optional directory for PNG copies of the figures.
+        **options: Passed to :func:`interpretability_report` (``scorer``,
+            ``n_repeats``, ``event_tolerance``, ``time_fractions``,
+            ``n_samples``, ``seed``).
+    """
+
+    def __init__(self, blackbox=None, reference_rules=None, rule_modes=("soft",),
+                 save_dir=None, **options):
+        super().__init__()
+        self.blackbox = blackbox
+        self.reference_rules = reference_rules
+        self.rule_modes = tuple(rule_modes)
+        self.save_dir = save_dir
+        self.options = options
+        self.report = None
+
+    def on_test_end(self, trainer, pl_module) -> None:
+        from .high.models.cmrts_report import flatten_report, interpretability_report
+        from .high.rules.plotting import plot_intervention_curves
+
+        loaders = trainer.test_dataloaders
+        loader = loaders[0] if isinstance(loaders, (list, tuple)) else loaders
+        if self.blackbox is not None:
+            self.blackbox.to(pl_module.device)
+        self.report = {}
+        for mode in self.rule_modes:
+            report = interpretability_report(
+                pl_module.model, loader, self.blackbox, self.reference_rules,
+                rule_mode=mode, **self.options,
+            )
+            self.report[mode] = report
+            flat = flatten_report(report, prefix=f"interp/{mode}")
+            for logger in trainer.loggers:
+                logger.log_metrics(flat, step=trainer.global_step)
+            figure = plot_intervention_curves(
+                report["interventions"]["curves"],
+                scorer=self.options.get("scorer", "auroc").upper(),
+                title=f"concept interventions · {mode} rules",
+            )
+            emit_figure(trainer, f"plots/intervention_curves_{mode}", figure,
+                        max(trainer.current_epoch - 1, 0), self.save_dir)

@@ -60,7 +60,11 @@ from .modules.loss import PyCLoss, ConceptLoss, ConceptSubset, WeightedConceptLo
     MSEReconstructionLoss, KLDivergenceLoss, OrthogonalityLoss, NLLProbLoss
 
 # Training callbacks
-from .modules.callbacks import LossWeightWarmup, TemporalCMRMonitor
+from .modules.callbacks import (
+    LossWeightWarmup,
+    TemporalCMRMonitor,
+    TemporalInterpretabilityReport,
+)
 
 # Metrics
 from .modules.metrics import ConceptMetrics, compute_cace
@@ -82,10 +86,34 @@ from .modules.high.models.cmrts import (
     ConceptMemoryReasonerTS,
     STLRuleDecoder,
     STLRuleSpec,
+    SequenceBlackBox,
+    discrete_rules,
     SequenceEncoder,
 )
 from .modules.high.rules.snf import SNFConfig, SNFRuleDecoder
 from .modules.high.models.cmrts_learner import TemporalCMRLearner
+from .modules.high.models.cmrts_evaluation import (
+    collect_predictions,
+    concept_completeness,
+    concept_scores,
+    event_scores,
+    exported_rule_specs,
+    rule_compactness,
+    rule_fidelity,
+    rule_language_completeness,
+)
+from .modules.high.models.cmrts_report import flatten_report, interpretability_report
+from .modules.high.models.cmrts_interventions import (
+    TimeMaskedIntervention,
+    concept_intervention_curve,
+    edit_rule,
+    force_rule,
+    intervene_on_concepts,
+    remove_rule,
+    rule_intervention_scores,
+    single_concept_effects,
+    time_intervention_curve,
+)
 
 # Models (mid-level)
 from .modules.mid.factors.factor import ParametricFactor
@@ -210,10 +238,32 @@ __all__ = [
     "SNFConfig",
     "SNFRuleDecoder",
     "TemporalCMRLearner",
+    "SequenceBlackBox",
+    "discrete_rules",
+    "collect_predictions",
+    "concept_completeness",
+    "rule_language_completeness",
+    "TimeMaskedIntervention",
+    "concept_intervention_curve",
+    "intervene_on_concepts",
+    "single_concept_effects",
+    "time_intervention_curve",
+    "edit_rule",
+    "force_rule",
+    "remove_rule",
+    "rule_intervention_scores",
+    "exported_rule_specs",
+    "rule_fidelity",
+    "concept_scores",
+    "event_scores",
+    "rule_compactness",
 
     # Training callbacks
     "LossWeightWarmup",
     "TemporalCMRMonitor",
+    "TemporalInterpretabilityReport",
+    "interpretability_report",
+    "flatten_report",
 
     # Metrics
     "ConceptMetrics",
